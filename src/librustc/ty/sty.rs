@@ -11,8 +11,9 @@ use crate::ty::subst::{Substs, Subst, Kind, UnpackedKind};
 use crate::ty::{self, AdtDef, TypeFlags, Ty, TyCtxt, TypeFoldable};
 use crate::ty::{List, TyS, ParamEnvAnd, ParamEnv};
 use crate::util::captures::Captures;
-use crate::mir::interpret::{Scalar, Pointer};
+use crate::mir::interpret::{Scalar, Pointer, Allocation};
 
+use std::hash::{Hash, Hasher};
 use smallvec::SmallVec;
 use std::iter;
 use std::cmp::Ordering;
@@ -2065,7 +2066,7 @@ pub enum LazyConst<'tcx> {
 }
 
 #[cfg(target_arch = "x86_64")]
-static_assert!(LAZY_CONST_SIZE: ::std::mem::size_of::<LazyConst<'static>>() == 56);
+static_assert!(LAZY_CONST_SIZE: ::std::mem::size_of::<LazyConst<'static>>() == 80);
 
 impl<'tcx> LazyConst<'tcx> {
     pub fn map_evaluated<R>(self, f: impl FnOnce(Const<'tcx>) -> Option<R>) -> Option<R> {
@@ -2086,15 +2087,68 @@ impl<'tcx> LazyConst<'tcx> {
 }
 
 /// Typed constant value.
-#[derive(Copy, Clone, Debug, Hash, RustcEncodable, RustcDecodable, Eq, PartialEq, Ord, PartialOrd)]
+#[derive(Copy, Clone, Debug, RustcEncodable, RustcDecodable, Eq, Ord, PartialOrd)]
 pub struct Const<'tcx> {
     pub ty: Ty<'tcx>,
 
-    pub val: ConstValue<'tcx>,
+    /// This field is an optimization for caching commonly needed values of constants like `usize`
+    /// (or other integers for enum discriminants) and slices (e.g. from `b"foo"` and `"foo"`
+    /// literals)
+    pub val: ConstValue,
+
+    /// The actual backing storage of the constant and a pointer which can be resolved back to the
+    /// `allocation` field
+    ///
+    /// Can be `None` for trivial constants created from literals or directly. Is always `Some` for
+    /// aggregate constants or any named constant that you can actually end up taking a reference
+    /// to. This will get unwrapped in situations where we do know that it's a referencable
+    pub alloc: Option<(&'tcx Allocation, Pointer)>,
+}
+
+impl<'tcx> PartialEq for Const<'tcx> {
+    fn eq(&self, other: &Self) -> bool {
+
+        self.ty == other.ty && match (self.val, other.val) {
+            (ConstValue::ByRef, ConstValue::ByRef) => {
+                let (a, pa) = self.alloc.unwrap();
+                let (b, pb) = other.alloc.unwrap();
+                // only use the alloc ids to not have to compare the full allocations
+                // the ids may differ if the allocation is the same
+                (pa.offset == pb.offset) && (pa.alloc_id == pb.alloc_id || a == b)
+            },
+            // ignore the actual allocation, just compare the values
+            (ConstValue::Scalar(a), ConstValue::Scalar(b)) => a == b,
+            (ConstValue::Slice(a, an), ConstValue::Slice(b, bn)) => an == bn && a == b,
+            // if the values don't match, the consts can't be equal and the type equality should
+            // have already failed, because we make the decision for non-byref solely based on the
+            // type
+            _ => bug!("same type but different value kind in constant: {:#?} {:#?}", self, other),
+        }
+    }
+}
+
+impl<'tcx> Hash for Const<'tcx> {
+    fn hash<H: Hasher>(&self, hasher: &mut H) {
+        let Const { ty, val, alloc } = self;
+        ty.hash(hasher);
+        val.hash(hasher);
+        // don't hash the memory for `Scalar` and `Slice`. There's nothing to be gained
+        // by it. All the relevant info is contained in the value.
+        if let ConstValue::ByRef = val {
+            let (alloc, ptr) = alloc.unwrap();
+            // type check for future changes
+            let alloc: &'tcx Allocation = alloc;
+            alloc.hash(hasher);
+            ptr.offset.hash(hasher);
+            // do not hash the alloc id in the pointer. It does not add anything new to the hash.
+            // If the hash of the alloc id is the same, then the hash of the allocation would also
+            // be the same.
+        }
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
-static_assert!(CONST_SIZE: ::std::mem::size_of::<Const<'static>>() == 48);
+static_assert!(CONST_SIZE: ::std::mem::size_of::<Const<'static>>() == 72);
 
 impl<'tcx> Const<'tcx> {
     #[inline]
@@ -2105,6 +2159,7 @@ impl<'tcx> Const<'tcx> {
         Self {
             val: ConstValue::Scalar(val),
             ty,
+            alloc: None,
         }
     }
 

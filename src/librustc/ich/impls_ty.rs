@@ -300,15 +300,18 @@ impl_stable_hash_for!(struct ty::FieldDef {
 });
 
 impl_stable_hash_for!(
-    impl<'tcx> for enum mir::interpret::ConstValue<'tcx> [ mir::interpret::ConstValue ] {
+    impl<'tcx> for enum mir::interpret::ConstValue [ mir::interpret::ConstValue ] {
         Scalar(val),
         Slice(a, b),
-        ByRef(id, alloc, offset),
+        ByRef,
     }
 );
+
 impl_stable_hash_for!(struct crate::mir::interpret::RawConst<'tcx> {
+    // FIXME(oli-obk): is ignoring the `alloc_id` for perf reasons ok?
     alloc_id,
     ty,
+    alloc,
 });
 
 impl_stable_hash_for! {
@@ -372,10 +375,30 @@ impl_stable_hash_for!(enum ::syntax::ast::Mutability {
     Mutable
 });
 
-impl_stable_hash_for!(struct ty::Const<'tcx> {
-    ty,
-    val
-});
+
+impl<'a, 'gcx> HashStable<StableHashingContext<'a>> for ty::Const<'gcx> {
+    fn hash_stable<W: StableHasherResult>(
+        &self,
+        hcx: &mut StableHashingContext<'a>,
+        hasher: &mut StableHasher<W>,
+    ) {
+        let ty::Const { ty, val, alloc } = self;
+        ty.hash_stable(hcx, hasher);
+        val.hash_stable(hcx, hasher);
+        // don't hash the memory for `Scalar` and `Slice`. There's nothing to be gained
+        // by it. All the relevant info is contained in the value.
+        if let mir::interpret::ConstValue::ByRef = val {
+            let (alloc, ptr) = alloc.unwrap();
+            // type check for future changes
+            let alloc: &'gcx mir::interpret::Allocation = alloc;
+            alloc.hash_stable(hcx, hasher);
+            ptr.offset.hash_stable(hcx, hasher);
+            // do not hash the alloc id in the pointer. It does not add anything new to the hash.
+            // If the hash of the alloc id is the same, then the hash of the allocation would also
+            // be the same.
+        }
+    }
+}
 
 impl_stable_hash_for!(impl<'tcx> for enum ty::LazyConst<'tcx> [ty::LazyConst] {
     Unevaluated(did, substs),

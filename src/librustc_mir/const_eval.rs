@@ -56,34 +56,27 @@ pub(crate) fn eval_promoted<'a, 'mir, 'tcx>(
     cid: GlobalId<'tcx>,
     mir: &'mir mir::Mir<'tcx>,
     param_env: ty::ParamEnv<'tcx>,
-) -> EvalResult<'tcx, MPlaceTy<'tcx>> {
+) -> EvalResult<'tcx, (MPlaceTy<'tcx>, &'tcx Allocation)> {
     let span = tcx.def_span(cid.instance.def_id());
     let mut ecx = mk_eval_cx(tcx, span, param_env);
     eval_body_using_ecx(&mut ecx, cid, Some(mir), param_env)
 }
 
 // FIXME: These two conversion functions are bad hacks.  We should just always use allocations.
-pub fn op_to_const<'tcx>(
+fn op_to_const<'tcx>(
     ecx: &CompileTimeEvalContext<'_, '_, 'tcx>,
     op: OpTy<'tcx>,
-    may_normalize: bool,
 ) -> EvalResult<'tcx, ty::Const<'tcx>> {
     // We do not normalize just any data.  Only scalar layout and slices.
-    let normalize = may_normalize
-        && match op.layout.abi {
-            layout::Abi::Scalar(..) => true,
-            layout::Abi::ScalarPair(..) => op.layout.ty.is_slice(),
-            _ => false,
-        };
-    let normalized_op = if normalize {
-        ecx.try_read_immediate(op)?
-    } else {
-        match *op {
+    let normalized_op = match op.layout.abi {
+        layout::Abi::Scalar(..) => ecx.try_read_immediate(op)?,
+        layout::Abi::ScalarPair(..) if op.layout.ty.is_slice() => ecx.try_read_immediate(op)?,
+        _ => match *op {
             Operand::Indirect(mplace) => Err(mplace),
             Operand::Immediate(val) => Ok(val)
-        }
+        },
     };
-    let val = match normalized_op {
+    let (val, alloc) = match normalized_op {
         Err(MemPlace { ptr, align, meta }) => {
             // extract alloc-offset pair
             assert!(meta.is_none());
@@ -96,14 +89,14 @@ pub fn op_to_const<'tcx>(
             // FIXME shouldn't it be the case that `mark_static_initialized` has already
             // interned this?  I thought that is the entire point of that `FinishStatic` stuff?
             let alloc = ecx.tcx.intern_const_alloc(alloc);
-            ConstValue::ByRef(ptr.alloc_id, alloc, ptr.offset)
+            (ConstValue::ByRef, Some((alloc, ptr)))
         },
         Ok(Immediate::Scalar(x)) =>
-            ConstValue::Scalar(x.not_undef()?),
+            (ConstValue::Scalar(x.not_undef()?), None),
         Ok(Immediate::ScalarPair(a, b)) =>
-            ConstValue::Slice(a.not_undef()?, b.to_usize(ecx)?),
+            (ConstValue::Slice(a.not_undef()?, b.to_usize(ecx)?), None),
     };
-    Ok(ty::Const { val, ty: op.layout.ty })
+    Ok(ty::Const { val, ty: op.layout.ty, alloc })
 }
 
 fn eval_body_and_ecx<'a, 'mir, 'tcx>(
@@ -111,7 +104,10 @@ fn eval_body_and_ecx<'a, 'mir, 'tcx>(
     cid: GlobalId<'tcx>,
     mir: Option<&'mir mir::Mir<'tcx>>,
     param_env: ty::ParamEnv<'tcx>,
-) -> (EvalResult<'tcx, MPlaceTy<'tcx>>, CompileTimeEvalContext<'a, 'mir, 'tcx>) {
+) -> (
+    EvalResult<'tcx, (MPlaceTy<'tcx>, &'tcx Allocation)>,
+    CompileTimeEvalContext<'a, 'mir, 'tcx>,
+) {
     // we start out with the best span we have
     // and try improving it down the road when more information is available
     let span = tcx.def_span(cid.instance.def_id());
@@ -127,7 +123,7 @@ fn eval_body_using_ecx<'mir, 'tcx>(
     cid: GlobalId<'tcx>,
     mir: Option<&'mir mir::Mir<'tcx>>,
     param_env: ty::ParamEnv<'tcx>,
-) -> EvalResult<'tcx, MPlaceTy<'tcx>> {
+) -> EvalResult<'tcx, (MPlaceTy<'tcx>, &'tcx Allocation)> {
     debug!("eval_body_using_ecx: {:?}, {:?}", cid, param_env);
     let tcx = ecx.tcx.tcx;
     let mut mir = match mir {
@@ -164,10 +160,10 @@ fn eval_body_using_ecx<'mir, 'tcx>(
     } else {
         Mutability::Immutable
     };
-    ecx.memory.intern_static(ret.ptr.to_ptr()?.alloc_id, mutability)?;
+    let alloc = ecx.memory.intern_static(ret.ptr.to_ptr()?.alloc_id, mutability)?;
 
     debug!("eval_body_using_ecx done: {:?}", *ret);
-    Ok(ret)
+    Ok((ret, alloc))
 }
 
 impl<'tcx> Into<EvalError<'tcx>> for ConstEvalError {
@@ -486,7 +482,7 @@ pub fn const_field<'a, 'tcx>(
         let field = ecx.operand_field(down, field.index() as u64)?;
         // and finally move back to the const world, always normalizing because
         // this is not called for statics.
-        op_to_const(&ecx, field, true)
+        op_to_const(&ecx, field)
     })();
     result.map_err(|error| {
         let err = error_to_const_error(&ecx, error);
@@ -520,7 +516,6 @@ fn validate_and_turn_into_const<'a, 'tcx>(
     constant: RawConst<'tcx>,
     key: ty::ParamEnvAnd<'tcx, GlobalId<'tcx>>,
 ) -> ::rustc::mir::interpret::ConstEvalResult<'tcx> {
-    let cid = key.value;
     let ecx = mk_eval_cx(tcx, tcx.def_span(key.value.instance.def_id()), key.param_env);
     let val = (|| {
         let op = ecx.raw_const_to_mplace(constant)?.into();
@@ -536,9 +531,25 @@ fn validate_and_turn_into_const<'a, 'tcx>(
             )?;
         }
         // Now that we validated, turn this into a proper constant.
-        let def_id = cid.instance.def.def_id();
-        let normalize = tcx.is_static(def_id).is_none() && cid.promoted.is_none();
-        op_to_const(&ecx, op, normalize)
+
+        // We also store a simpler version of certain constants in the `val` field of `ty::Const`
+        // This helps us reduce the effort required to access e.g. the `usize` constant value for
+        // array lengths. Since array lengths make up a non-insignificant amount of all of the
+        // constants in the compiler, this caching has a very noticeable effect.
+
+        // FIXME(oli-obk): see if creating a query to go from an `Allocation` + offset to a
+        // `ConstValue` is just as effective as proactively generating the `ConstValue`.
+        let val = match op.layout.abi {
+            layout::Abi::Scalar(..) => ConstValue::Scalar(ecx.read_immediate(op)?.to_scalar()?),
+            layout::Abi::ScalarPair(..) if op.layout.ty.is_slice() => {
+                let (a, b) = ecx.read_immediate(op)?.to_scalar_pair()?;
+                ConstValue::Slice(a, b.to_usize(&ecx)?)
+            },
+            _ => ConstValue::ByRef,
+        };
+        let ptr = Pointer::from(constant.alloc_id);
+        let alloc = constant.alloc;
+        Ok(ty::Const { val, ty: op.layout.ty, alloc: Some((alloc, ptr))})
     })();
 
     val.map_err(|error| {
@@ -634,9 +645,10 @@ pub fn const_eval_raw_provider<'a, 'tcx>(
     };
 
     let (res, ecx) = eval_body_and_ecx(tcx, cid, None, key.param_env);
-    res.and_then(|place| {
+    res.and_then(|(place, alloc)| {
         Ok(RawConst {
             alloc_id: place.to_ptr().expect("we allocated this ptr!").alloc_id,
+            alloc,
             ty: place.layout.ty
         })
     }).map_err(|error| {

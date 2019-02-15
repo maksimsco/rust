@@ -348,10 +348,9 @@ impl<'a, 'mir, 'tcx, M: Machine<'a, 'mir, 'tcx>> Memory<'a, 'mir, 'tcx, M> {
                 ErrorHandled::TooGeneric => EvalErrorKind::TooGeneric.into(),
             }
         }).map(|raw_const| {
-            let allocation = tcx.alloc_map.lock().unwrap_memory(raw_const.alloc_id);
             // We got tcx memory. Let the machine figure out whether and how to
             // turn that into memory with the right pointer tag.
-            M::adjust_static_allocation(allocation, memory_extra)
+            M::adjust_static_allocation(raw_const.alloc, memory_extra)
         })
     }
 
@@ -621,7 +620,7 @@ where
         &mut self,
         alloc_id: AllocId,
         mutability: Mutability,
-    ) -> EvalResult<'tcx> {
+    ) -> EvalResult<'tcx, &'tcx Allocation> {
         trace!(
             "mark_static_initialized {:?}, mutability: {:?}",
             alloc_id,
@@ -647,7 +646,7 @@ where
             // does not permit code that would break this!
             if self.alloc_map.contains_key(&alloc) {
                 // Not yet interned, so proceed recursively
-                self.intern_static(alloc, mutability)?;
+                let _alloc = self.intern_static(alloc, mutability)?;
             } else if self.dead_alloc_map.contains_key(&alloc) {
                 // dangling pointer
                 return err!(ValidationFailure(
@@ -655,7 +654,7 @@ where
                 ))
             }
         }
-        Ok(())
+        Ok(alloc)
     }
 }
 
